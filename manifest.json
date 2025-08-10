@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "Google CM Code Monitor",
+  "version": "1.0",
+  "description": "Monitor network requests for Google Campaign Manager codes with OAuth authentication",
+  "permissions": [
+    "webRequest",
+    "tabs",
+    "activeTab",
+    "storage",
+    "identity"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "CM Code Monitor"
+  },
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1R79lPisyXAmXRTODjEYa5TZD1Mj6KvgS3eIrRIHMkK97HGozCG4Ql8krpn5TlCby0W1WkEjjOni23CShmHAFQbi7ujStNeKriaCGl8XhRmFvErPKlcOQI0cn4j4UDYHWMLLpl7JKhzePwEXatlG9hj27patVnRHhck+W/lhDFhnberDbeaZEz/8Mh8yf9tS6CdVNGunquQk8nnJXEuOV8sjORtDd6RPnSYHZQ7kHKNXznqQ+QNeAphGc6/DQNLOmaMgPSDmWs2+Knuja9Coce5VUsKk9C8PLO8J5e7d2ZkpMu+FKgJIALMcQBFox7k2mPhQHB+8TUgU15pxISzqEwIDAQAB",
+  "oauth2": {
+    "client_id": "8322403152-p4f7gsqijo4jm80vh5hrknkd87v5v8no.apps.googleusercontent.com",
+    "scopes": [
+      "https://www.googleapis.com/auth/dfareporting",
+      "https://www.googleapis.com/auth/userinfo.email",
+      "https://www.googleapis.com/auth/userinfo.profile"
+    ]
+  }
+}
