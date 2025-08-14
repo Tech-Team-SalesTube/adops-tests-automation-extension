@@ -14,7 +14,7 @@ document.addEventListener('DOMContentLoaded', () => {
     cmCodesList: document.querySelector('#cmCodes .url-list-inner'),
     cmCodesContainer: document.getElementById('cmCodes'),
     copyBtn: document.getElementById('copyBtn'),
-    exportBtn: document.getElementById('exportBtn'),
+    checkCmBtn: document.getElementById('checkCmBtn'),
   };
 
   // event listeners
@@ -56,25 +56,18 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   });
   
-  elements.exportBtn.addEventListener('click', () => {
-    elements.exportBtn.textContent = '📤 Exporting...';
-    elements.exportBtn.disabled = true;
+  elements.checkCmBtn.addEventListener('click', () => {
+    elements.checkCmBtn.textContent = '🔄 Checking...';
+    elements.checkCmBtn.disabled = true;
     
-    chrome.runtime.sendMessage({ action: 'exportData' }, (response) => {
-      elements.exportBtn.disabled = false;
+    chrome.runtime.sendMessage({ action: 'checkInCM' }, (response) => {
+      elements.checkCmBtn.disabled = false;
+      elements.checkCmBtn.textContent = '🔍 Check in CM';
       
       if (response && response.success) {
-        console.log('Exporting data:', response.data);
-        const exportText = JSON.stringify(response.data, null, 2);
-        navigator.clipboard.writeText(exportText).then(() => {
-          elements.exportBtn.textContent = '✅ Copied to Clipboard!';
-          setTimeout(() => {
-            elements.exportBtn.textContent = '📤 Export for API';
-          }, 3000);
-        });
+        console.log('CM check completed:', response.data);
       } else {
-        elements.exportBtn.textContent = '📤 Export for API';
-        alert('Export failed: ' + (response ? response.error : 'Unknown error'));
+        alert('CM check failed: ' + (response ? response.error : 'Unknown error'));
       }
     });
   });
@@ -133,7 +126,7 @@ document.addEventListener('DOMContentLoaded', () => {
       const hasCmCodes = state.googleCmCodes && state.googleCmCodes.length > 0;
       elements.cmCodesContainer.style.display = hasCmCodes ? 'block' : 'none';
       elements.copyBtn.style.display = hasCmCodes ? 'inline-block' : 'none';
-      elements.exportBtn.style.display = hasCmCodes && isAuthenticated ? 'inline-block' : 'none';
+      elements.checkCmBtn.style.display = hasCmCodes && isAuthenticated ? 'inline-block' : 'none';
       
       if (hasCmCodes) {
         elements.cmCodesList.innerHTML = state.googleCmCodes

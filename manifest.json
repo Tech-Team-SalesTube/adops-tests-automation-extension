@@ -20,6 +20,12 @@
     "default_popup": "popup.html",
     "default_title": "CM Code Monitor"
   },
+  "web_accessible_resources": [
+    {
+      "resources": ["results.html"],
+      "matches": ["<all_urls>"]
+    }
+  ],
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1R79lPisyXAmXRTODjEYa5TZD1Mj6KvgS3eIrRIHMkK97HGozCG4Ql8krpn5TlCby0W1WkEjjOni23CShmHAFQbi7ujStNeKriaCGl8XhRmFvErPKlcOQI0cn4j4UDYHWMLLpl7JKhzePwEXatlG9hj27patVnRHhck+W/lhDFhnberDbeaZEz/8Mh8yf9tS6CdVNGunquQk8nnJXEuOV8sjORtDd6RPnSYHZQ7kHKNXznqQ+QNeAphGc6/DQNLOmaMgPSDmWs2+Knuja9Coce5VUsKk9C8PLO8J5e7d2ZkpMu+FKgJIALMcQBFox7k2mPhQHB+8TUgU15pxISzqEwIDAQAB",
   "oauth2": {
     "client_id": "8322403152-p4f7gsqijo4jm80vh5hrknkd87v5v8no.apps.googleusercontent.com",

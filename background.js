@@ -1,3 +1,7 @@
+// config
+const CM_API_ENDPOINT = 'https://adops-tests-automation-niedzwiedz-ze-mna-applicat-ehdnoy3lyq-uc.a.run.app/papiez/submit';
+
+// global state
 let isMonitoring = false;
 let monitoredTabs = new Set();
 let monitoredTabUrls = new Set();
@@ -21,6 +25,29 @@ async function fetchUserProfile(token) {
     console.error('Error fetching user profile:', error);
     return null;
   }
+}
+
+// Token management utilities
+function isTokenExpired(authData) {
+  if (!authData || !authData.timestamp) return true;
+  // check if token is older than 55 minutes
+  const FIFTY_FIVE_MINUTES = 55 * 60 * 1000;
+  return (Date.now() - authData.timestamp) > FIFTY_FIVE_MINUTES;
+}
+
+function ensureValidToken() {
+  if (!userAuthData) {
+    throw new Error('User not authenticated. Please login first.');
+  }
+  
+  if (isTokenExpired(userAuthData)) {
+    // clear expired auth data
+    userAuthData = null;
+    chrome.storage.local.remove('userAuthData');
+    throw new Error('Authentication expired. Please login again.');
+  }
+  
+  return userAuthData.access_token;
 }
 
 // auth
@@ -71,9 +98,12 @@ async function handleLogout(sendResponse) {
   }
 }
 
-// data export
-async function exportDataForAPI(sendResponse) {
+// CM check
+async function checkInCM(sendResponse) {
   try {
+    // ensure we have a valid token before proceeding
+    const validToken = ensureValidToken();
+    
     const monitoredTabsArray = Array.from(monitoredTabs);
     for (const tabId of monitoredTabsArray) {
       try {
@@ -86,22 +116,50 @@ async function exportDataForAPI(sendResponse) {
       }
     }
 
-    const exportData = {
+    const requestData = {
       codes: Array.from(googleCmCodes),
-      auth: userAuthData ? {
-        access_token: userAuthData.access_token,
+      auth: {
+        access_token: validToken,
         scopes: userAuthData.scopes || []
-      } : null,
+      },
       metadata: {
         test_urls: Array.from(monitoredTabUrls),
         timestamp: new Date().toISOString()
       }
     };
     
-    console.log('Export data prepared for REST API:', exportData);
-    sendResponse({ success: true, data: exportData });
+    console.log('Sending data to CM API:', requestData);
+    
+    const response = await fetch(CM_API_ENDPOINT, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(requestData)
+    });
+    
+    if (!response.ok) {
+      throw new Error(`API request failed: ${response.status} ${response.statusText}`);
+    }
+    
+    const apiResponse = await response.json();
+    console.log('CM API response:', apiResponse);
+    
+    // create new tab with results
+    const resultsTab = await chrome.tabs.create({
+      url: chrome.runtime.getURL('results.html'),
+      active: true
+    });
+    
+    // store response data for the results page
+    await chrome.storage.local.set({ 
+      cmApiResponse: apiResponse,
+      resultsTabId: resultsTab.id 
+    });
+    
+    sendResponse({ success: true, data: apiResponse });
   } catch (error) {
-    console.error('Error preparing export data:', error);
+    console.error('Error checking in CM:', error);
     sendResponse({ success: false, error: error.message });
   }
 }
@@ -142,7 +200,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const actions = {
     googleAuth: handleGoogleAuth,
     logout: handleLogout,
-    exportData: exportDataForAPI,
+    checkInCM: checkInCM,
     startMonitoring: (cb) => { startMonitoring(message.tabId); cb({ success: true }); },
     stopMonitoring: (cb) => { stopMonitoring(); cb({ success: true }); },
     getResults: (cb) => cb({
