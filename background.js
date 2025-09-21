@@ -1,5 +1,5 @@
 // config
-const CM_API_ENDPOINT = 'https://adops-tests-automation-niedzwiedz-ze-mna-applicat-ehdnoy3lyq-uc.a.run.app/papiez/submit';
+const CM_API_ENDPOINT = 'https://adops-tests-automation-niedzwiedz-ze-mna-application-8322403152.us-central1.run.app/papiez/submit';
 
 // global state
 let isMonitoring = false;
