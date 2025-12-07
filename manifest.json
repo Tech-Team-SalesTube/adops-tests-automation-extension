@@ -8,7 +8,9 @@
     "tabs",
     "activeTab",
     "storage",
-    "identity"
+    "identity",
+    "scripting",
+    "webNavigation"
   ],
   "host_permissions": [
     "<all_urls>"
@@ -16,10 +18,7 @@
   "background": {
     "service_worker": "background.js"
   },
-  "action": {
-    "default_popup": "popup.html",
-    "default_title": "CM Code Monitor"
-  },
+  "devtools_page": "devtools.html",
   "web_accessible_resources": [
     {
       "resources": ["results.html"],
