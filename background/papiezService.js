@@ -49,9 +49,17 @@
     const processed = new Set();
 
     const recordResult = (item, bucket) => {
-      if (!item || typeof item.link !== 'string') return;
+      if (!item || typeof item.link !== 'string') {
+        console.warn('Papierz item missing link:', item);
+        return;
+      }
       const summary = session.cmCodes.get(item.link);
-      if (!summary) return;
+      if (!summary) {
+        console.warn('No matching CM code for Papierz response link:', item.link);
+        console.log('Available CM codes:', Array.from(session.cmCodes.keys()));
+        return;
+      }
+      console.log('✓ Matched Papierz response for:', item.link);
       summary.papiez = {
         bucket,
         lastFetchedAt: receivedAt,
@@ -67,6 +75,7 @@
 
     session.cmCodes.forEach((summary, url) => {
       if ((summary.type === 'trackclk' || summary.type === 'trackimp') && !processed.has(url)) {
+        console.log('✗ No Papierz data for CM code:', url);
         summary.papiez = {
           bucket: summary.type === 'trackclk' ? 'click' : 'view',
           lastFetchedAt: receivedAt,
@@ -176,6 +185,20 @@
       }
 
       const apiResponse = await response.json();
+
+      // Debug logging for Papierz response
+      console.log('=== PAPIERZ REQUEST/RESPONSE DEBUG ===');
+      console.log('Sent codes:', urls);
+      console.log('Response click codes:', apiResponse?.click?.length || 0);
+      console.log('Response view codes:', apiResponse?.view?.length || 0);
+      if (apiResponse?.click?.length > 0) {
+        console.log('Sample click response:', apiResponse.click[0]);
+      }
+      if (apiResponse?.view?.length > 0) {
+        console.log('Sample view response:', apiResponse.view[0]);
+      }
+      console.log('=====================================');
+
       await applyPapiezResults(session, apiResponse, reason);
 
       if (sendResponse) {

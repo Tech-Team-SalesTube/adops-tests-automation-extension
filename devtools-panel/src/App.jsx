@@ -4,22 +4,43 @@ import './App.css';
 const TIMELINE_FLAG = 'CLICK_BEFORE_INTERACTION';
 const DEFAULT_TAB_COLOR = '#94a3b8';
 
+const FILTER_STORAGE_KEY = 'cm_monitor_filter_settings';
+const CM_CODES_FILTER_KEY = 'cm_monitor_show_only_cm_codes';
+
+// Ordered fields for Papierz display
+const PAPIERZ_FIELD_ORDER = [
+  'site_name',
+  'campaign_name',
+  'placement_name',
+  'ad_name',
+  'creative_name',
+  'urlpartnerid',
+  'urlgdpr',
+  'urlgdpr_consent',
+];
+
+// Parameters to exclude from "Inne parametry" section (already shown elsewhere)
+const EXCLUDED_FROM_OTHER_PARAMS = new Set([
+  // Papierz fields (avoid duplication with Papierz section)
+  'site_name', 'campaign_name', 'placement_name', 'ad_name', 'creative_name',
+  'urlpartnerid', 'urlgdpr', 'urlgdpr_consent',
+
+  // UTM params (shown in separate UTM section)
+  'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
+  'gclid', 'fbclid', 'dclid',
+
+  // CM structural/tracking params (technical, not user-relevant)
+  'dc_trk_cid', 'dc_trk_aid', 'trk_aid', 'ad', 'cid',
+  'dc_lat', 'dc_rdid', 'tag_for_child_directed_treatment',
+
+  // Embedded URL containers (content shown in UTM section via extraction)
+  'u1', 'u2', 'u3', 'u4', 'u5', 'url', 'destination', 'redirect_url', 'landing_url',
+]);
+
 function formatTimestamp(ts) {
   if (!ts) return '—';
   const date = new Date(ts);
   return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-}
-
-function formatDateTime(ts) {
-  if (!ts) return '—';
-  return new Date(ts).toLocaleString([], {
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-  });
 }
 
 function formatTabLabel(url) {
@@ -37,6 +58,98 @@ function formatTabLabel(url) {
   } catch (error) {
     return url.length > 36 ? `${url.slice(0, 33)}…` : url;
   }
+}
+
+// Extract Ad ID from Campaign Manager URL
+function extractAdId(url) {
+  if (!url) return '—';
+  try {
+    // Use parseUrlParameters to handle both ? and ; separated params
+    const params = parseUrlParameters(url);
+
+    // Try to extract from 'ad' parameter
+    if (params.ad) return params.ad;
+
+    // Try Campaign Manager tracking aid parameter
+    if (params.trk_aid) return params.trk_aid;
+
+    // Try DoubleClick tracking aid parameter
+    if (params.dc_trk_aid) return params.dc_trk_aid;
+
+    return '—';
+  } catch (error) {
+    return '—';
+  }
+}
+
+// Parse all URL parameters (both ? query params and ; semicolon params)
+function parseUrlParameters(url) {
+  if (!url) return {};
+  try {
+    const params = {};
+
+    // Parse standard query parameters (?key=value&key2=value2)
+    const parsed = new URL(url);
+    parsed.searchParams.forEach((value, key) => {
+      params[key] = value;
+    });
+
+    // Parse semicolon-separated parameters (common in DoubleClick URLs)
+    // Example: ;dc_trk_aid=123;dc_trk_cid=456;gdpr=1
+    const urlString = url.split('?')[0]; // Get part before ? (if any)
+    const semicolonParts = urlString.split(';');
+
+    for (let i = 1; i < semicolonParts.length; i++) {
+      const part = semicolonParts[i];
+      const equalIndex = part.indexOf('=');
+      if (equalIndex > 0) {
+        const key = part.substring(0, equalIndex);
+        const value = part.substring(equalIndex + 1);
+        params[key] = value;
+      }
+    }
+
+    return params;
+  } catch (error) {
+    return {};
+  }
+}
+
+// Check if GDPR is present and valid
+function validateGdprPresence(papiezData) {
+  if (!papiezData) return { hasGdpr: true, message: null };
+
+  const gdprValue = papiezData.urlgdpr;
+  if (gdprValue === undefined || gdprValue === null || gdprValue === '') {
+    return { hasGdpr: false, message: 'Brak urlgdpr' };
+  }
+
+  return { hasGdpr: true, message: null };
+}
+
+// Match impression and click codes by common identifier
+function matchImpressionWithClick(codes) {
+  // Group codes by a common identifier (e.g., creative ID or placement ID)
+  const groups = new Map();
+
+  codes.forEach((code) => {
+    const params = parseUrlParameters(code.url);
+    // Try multiple possible identifiers
+    const identifier = params.dc_trk_cid || params.trk_aid || params.dc_trk_aid || params.cid || code.url;
+
+    if (!groups.has(identifier)) {
+      groups.set(identifier, { impression: null, click: null });
+    }
+
+    const group = groups.get(identifier);
+    if (code.type === 'trackimp') {
+      group.impression = code;
+    } else if (code.type === 'trackclk') {
+      group.click = code;
+    }
+  });
+
+  return groups;
 }
 
 function withOpacity(color, alpha) {
@@ -86,27 +199,16 @@ function resolveStatusClass(status) {
 function createRequestFilter(term) {
   if (!term) return () => true;
   const needle = term.trim().toLowerCase();
-  return (request) => request.url.toLowerCase().includes(needle) || request.type.toLowerCase().includes(needle);
+  return (request) => {
+    const adId = extractAdId(request.url);
+    return (
+      request.url.toLowerCase().includes(needle) ||
+      request.type.toLowerCase().includes(needle) ||
+      adId.toLowerCase().includes(needle)
+    );
+  };
 }
 
-function createCodeFilter(term) {
-  if (!term) return () => true;
-  const needle = term.trim().toLowerCase();
-  return (code) => code.url.toLowerCase().includes(needle) || code.type.toLowerCase().includes(needle);
-}
-
-function derivePapiezStatus(papiez) {
-  if (!papiez) {
-    return { label: 'Pending', tone: 'idle' };
-  }
-  if (papiez.error) {
-    return { label: 'Error', tone: 'danger', message: papiez.error };
-  }
-  if (papiez.data) {
-    return { label: 'Ready', tone: 'success' };
-  }
-  return { label: 'No data', tone: 'warning' };
-}
 
 function AuthCard({ authInfo, loading, error, onLogin, onLogout }) {
   const isAuthenticated = Boolean(authInfo?.access_token);
@@ -121,7 +223,7 @@ function AuthCard({ authInfo, loading, error, onLogin, onLogout }) {
           <>
             <strong>{name || 'Authenticated'}</strong>
             {email ? <span className="small-text">{email}</span> : null}
-            <span className="small-text">Scopes: {scopes} · Refreshed {formatDateTime(authInfo?.timestamp)}</span>
+            <span className="small-text">Scopes: {scopes}</span>
           </>
         ) : (
           <>
@@ -146,7 +248,7 @@ function AuthCard({ authInfo, loading, error, onLogin, onLogout }) {
   );
 }
 
-function RequestsTable({ requests, selectedUrl, onSelectUrl, tabLookup, fallbackColor }) {
+function RequestsTable({ requests, selectedUrl, onSelectUrl, tabLookup, fallbackColor, cmCodesMap, requestToGroupMap, impressionClickGroups }) {
   if (!requests.length) {
     return <div className="empty-state">No matching requests observed yet.</div>;
   }
@@ -159,24 +261,37 @@ function RequestsTable({ requests, selectedUrl, onSelectUrl, tabLookup, fallback
       <table className="request-table">
         <thead>
           <tr>
-            <th>#</th>
             <th>Type</th>
+            <th>Ad ID</th>
+            <th>GDPR</th>
+            <th>Status</th>
             <th>Duplicates</th>
-            <th>Timeline</th>
-            <th>Tab</th>
             <th>Time</th>
             <th>URL</th>
           </tr>
         </thead>
         <tbody>
-          {requests.map((request) => {
+          {requests.map((request, index) => {
             const isSelectable = request.isCmCode;
             const isSelected = isSelectable && selectedUrl === request.url;
+
+            // Get CM code data for GDPR check
+            const cmCode = cmCodesMap?.get(request.url);
+            const gdprValidation = cmCode?.papiez?.data ? validateGdprPresence(cmCode.papiez.data) : { hasGdpr: true, message: null };
+
+            // Check if this is the first request in a group (for visual separator)
+            const groupId = requestToGroupMap?.get(request.url);
+            const prevRequest = index > 0 ? requests[index - 1] : null;
+            const prevGroupId = prevRequest ? requestToGroupMap?.get(prevRequest.url) : null;
+            const isFirstInGroup = groupId && groupId !== prevGroupId;
+
             const rowClassNames = [
               request.timelineFlag ? 'highlight' : '',
               isSelectable ? 'selectable' : '',
               isSelected ? 'selected' : '',
               request.isChildRequest ? 'child' : '',
+              !gdprValidation.hasGdpr ? 'missing-gdpr' : '',
+              isFirstInGroup ? 'group-start' : '',
             ]
               .filter(Boolean)
               .join(' ');
@@ -184,19 +299,27 @@ function RequestsTable({ requests, selectedUrl, onSelectUrl, tabLookup, fallback
             const tabMeta = lookup.get(request.tabId);
             const accentColor = request.tabColor || tabMeta?.color || baseColor;
             const label = tabMeta ? formatTabLabel(tabMeta.url) : `Tab ${request.tabId}`;
-            const rowStyle = !request.timelineFlag && !isSelected ? { borderLeft: `3px solid ${accentColor}` } : undefined;
+            const rowStyle = !request.timelineFlag && !isSelected && gdprValidation.hasGdpr
+              ? { borderLeft: `3px solid ${accentColor}` }
+              : !gdprValidation.hasGdpr && !isSelected
+              ? { borderLeft: `3px solid #f87171` }
+              : undefined;
+
+            const adId = extractAdId(request.url);
+            const statusCode = request.statusCode || '—';
 
             return (
               <tr
                 key={`${request.id}-${request.sequence}`}
                 className={rowClassNames}
                 style={rowStyle}
+                data-group-id={groupId}
                 onClick={() => {
                   if (!isSelectable) return;
                   onSelectUrl(request.url);
                 }}
+                title={request.url}
               >
-                <td>{request.sequence}</td>
                 <td>
                   <div className="type-cell">
                     <div className="type-row">
@@ -210,10 +333,22 @@ function RequestsTable({ requests, selectedUrl, onSelectUrl, tabLookup, fallback
                       </span>
                       {request.isChildRequest ? <span className="badge child">child tab</span> : null}
                     </div>
-                    <div className="tab-source-label" title={tabMeta?.url || label}>
-                      {label}
-                    </div>
                   </div>
+                </td>
+                <td className="truncate-cell" title={adId}>
+                  {adId}
+                </td>
+                <td>
+                  {!gdprValidation.hasGdpr ? (
+                    <span className="badge danger">{gdprValidation.message}</span>
+                  ) : (
+                    <span className="small-text">✓</span>
+                  )}
+                </td>
+                <td>
+                  <span className={`badge ${statusCode === '302' ? 'warning' : ''}`}>
+                    {statusCode}
+                  </span>
                 </td>
                 <td>
                   {request.duplicateCount > 1 ? (
@@ -222,18 +357,10 @@ function RequestsTable({ requests, selectedUrl, onSelectUrl, tabLookup, fallback
                     <span className="small-text">—</span>
                   )}
                 </td>
-                <td>
-                  {request.timelineFlag === TIMELINE_FLAG ? (
-                    <span className="timeline-flag">⚠ Click before user action</span>
-                  ) : (
-                    <span className="small-text">—</span>
-                  )}
-                </td>
-                <td>
-                  <span className="badge">{request.tabId}</span>
-                </td>
                 <td>{formatTimestamp(request.timestamp)}</td>
-                <td className="url-cell">{request.url}</td>
+                <td className="url-cell truncate-cell" title={request.url}>
+                  {request.url}
+                </td>
               </tr>
             );
           })}
@@ -243,117 +370,90 @@ function RequestsTable({ requests, selectedUrl, onSelectUrl, tabLookup, fallback
   );
 }
 
-function CmCodeList({ codes, selectedUrl, onSelect, rootTabId, tabLookup, fallbackColor }) {
-  if (!codes.length) {
-    return <div className="empty-state">No Campaign Manager codes observed yet.</div>;
-  }
 
-  const lookup = tabLookup || new Map();
-  const baseColor = fallbackColor || DEFAULT_TAB_COLOR;
+function CodeDetailPanel({ code, onClose }) {
+  const urlParams = parseUrlParameters(code.url);
+  const gdprValidation = code.papiez?.data ? validateGdprPresence(code.papiez.data) : { hasGdpr: true, message: null };
 
-  return (
-    <div className="code-list">
-      {codes.map((code) => {
-        const status =
-          code.type === 'trackclk' || code.type === 'trackimp'
-            ? derivePapiezStatus(code.papiez)
-            : { label: 'N/A', tone: 'idle' };
-        const seenTabsRaw = code.originTabs || [];
-        const uniqueTabIds = [...new Set(seenTabsRaw)];
-        const swatchIds = uniqueTabIds.length ? uniqueTabIds : rootTabId !== null ? [rootTabId] : [];
-        const safeSwatchIds = swatchIds.length ? swatchIds : [];
-        const seenOnChild = rootTabId !== null ? swatchIds.some((tabId) => tabId !== rootTabId) : false;
-        const primaryTab = swatchIds.length ? lookup.get(swatchIds[0]) : lookup.get(rootTabId);
-        const primaryColor = primaryTab?.color || baseColor;
-        const tabLabelsFull = swatchIds
-          .map((tabId) => {
-            const meta = lookup.get(tabId);
-            return meta ? formatTabLabel(meta.url) : `Tab ${tabId}`;
-          })
-          .join(', ');
-        const tabLabelDisplay = tabLabelsFull.length > 40 ? `${tabLabelsFull.slice(0, 37)}…` : tabLabelsFull;
-        const isSelected = selectedUrl === code.url;
-        return (
-          <button
-            type="button"
-            key={code.url}
-            className={`code-item ${isSelected ? 'selected' : ''}`}
-            onClick={() => onSelect(code.url)}
-          >
-            <div className="code-item-header">
-              <span
-                className="tab-color-dot"
-                style={{ backgroundColor: primaryColor }}
-                title={tabLabelsFull || 'Tab origin'}
-              />
-              <span className={`type-pill ${code.type}`}>{code.type === 'trackclk' ? 'click' : 'view'}</span>
-              <span className="badge repetitions">×{code.count}</span>
-              {seenOnChild ? <span className="badge child">child tab</span> : null}
-              <span className={`status-dot ${status.tone}`} />
-              <span className={`status-label ${status.tone}`}>{status.label}</span>
-            </div>
-            <div className="code-url">{code.url}</div>
-            <div className="code-meta">
-              <span>First seen {formatTimestamp(code.firstSeenAt)}</span>
-              <span>Last seen {formatTimestamp(code.lastSeenAt)}</span>
-              <span>Tabs: {safeSwatchIds.length}</span>
-              {code.papiez?.lastFetchedAt ? (
-                <span>Papierz {formatTimestamp(code.papiez.lastFetchedAt)}</span>
-              ) : null}
-            </div>
-            <div className="tab-meta" title={tabLabelsFull}>
-              <div className="tab-color-swatches">
-                {safeSwatchIds.map((tabId) => {
-                  const meta = lookup.get(tabId);
-                  const swatchColor = meta?.color || baseColor;
-                  return (
-                    <span
-                      key={`${code.url}-${tabId}`}
-                      className="tab-color-swatch"
-                      style={{ backgroundColor: swatchColor }}
-                    />
-                  );
-                })}
-              </div>
-              <span className="tab-origin-label">{tabLabelDisplay || 'Unknown tab'}</span>
-            </div>
-          </button>
-        );
-      })}
-    </div>
-  );
-}
+  // Order Papierz fields according to PAPIERZ_FIELD_ORDER
+  const papiezData = code.papiez?.data || {};
+  const orderedFields = [];
+  const remainingFields = [];
 
-function CodeDetailPanel({ code, onClose, rootTabId, tabLookup, fallbackColor }) {
-  const status = derivePapiezStatus(code.papiez);
-  const fields = code.papiez?.data ? Object.entries(code.papiez.data) : [];
-  const lookup = tabLookup || new Map();
-  const baseColor = fallbackColor || DEFAULT_TAB_COLOR;
-  const seenTabsRaw = code.originTabs || [];
-  const uniqueTabIds = [...new Set(seenTabsRaw.length ? seenTabsRaw : rootTabId !== null ? [rootTabId] : [])];
-  const seenOnChild = rootTabId !== null ? uniqueTabIds.some((tabId) => tabId !== rootTabId) : false;
-  const mappedTabItems = uniqueTabIds.map((tabId) => {
-    const meta = lookup.get(tabId);
-    return {
-      tabId,
-      color: meta?.color || baseColor,
-      label: meta ? formatTabLabel(meta.url) : `Tab ${tabId}`,
-      url: meta?.url || null,
-    };
+  PAPIERZ_FIELD_ORDER.forEach((fieldName) => {
+    if (papiezData.hasOwnProperty(fieldName)) {
+      orderedFields.push([fieldName, papiezData[fieldName]]);
+    }
   });
-  const tabItems = mappedTabItems.length
-    ? mappedTabItems
-    : [
-        {
-          tabId: rootTabId ?? 'n/a',
-          color: baseColor,
-          label: rootTabId !== null
-            ? formatTabLabel(lookup.get(rootTabId)?.url || '') || `Tab ${rootTabId}`
-            : 'Current tab',
-          url: lookup.get(rootTabId)?.url || null,
-        },
-      ];
-  const tabSummary = tabItems.map((item) => item.label).join(', ');
+
+  // Add remaining fields that are not in the ordered list
+  Object.entries(papiezData).forEach(([key, value]) => {
+    if (!PAPIERZ_FIELD_ORDER.includes(key)) {
+      remainingFields.push([key, value]);
+    }
+  });
+
+  const allPapiezFields = [...orderedFields, ...remainingFields];
+
+  // Filter URL parameters to exclude those already shown in other sections
+  const filteredUrlParams = Object.entries(urlParams).filter(
+    ([key]) => !EXCLUDED_FROM_OTHER_PARAMS.has(key)
+  );
+
+  // Extract UTM parameters from embedded URLs (like u1, u2, u3, url, destination)
+  const extractUtmFromEmbeddedUrls = () => {
+    console.log('=== UTM EXTRACTION DEBUG ===');
+    console.log('CM Code URL:', code.url);
+    console.log('All URL params:', urlParams);
+
+    const utmParams = [];
+    const urlContainingParams = ['u1', 'u2', 'u3', 'u4', 'u5', 'url', 'destination', 'redirect_url', 'landing_url'];
+
+    for (const paramName of urlContainingParams) {
+      if (urlParams[paramName]) {
+        console.log(`Found ${paramName} parameter:`, urlParams[paramName]);
+        try {
+          // Decode the URL (might be URL-encoded)
+          const decodedUrl = decodeURIComponent(urlParams[paramName]);
+          console.log(`Decoded ${paramName}:`, decodedUrl);
+
+          // Parse parameters from the embedded URL
+          const embeddedParams = parseUrlParameters(decodedUrl);
+          console.log(`Parsed params from ${paramName}:`, embeddedParams);
+
+          // Extract UTM and tracking parameters
+          Object.entries(embeddedParams).forEach(([key, value]) => {
+            if (key.startsWith('utm_') || key === 'gclid' || key === 'fbclid' || key === 'dclid') {
+              console.log(`Found UTM param: ${key} = ${value}`);
+              utmParams.push([key, value]);
+            }
+          });
+        } catch (e) {
+          console.warn(`Failed to decode ${paramName}:`, e);
+        }
+      }
+    }
+
+    console.log('Extracted UTM params:', utmParams);
+    console.log('===========================');
+    return utmParams;
+  };
+
+  // Also check for UTM params from HTTP redirect (if available)
+  console.log('Checking redirect URL:', code.redirectUrl);
+  const redirectParams = code.redirectUrl ? parseUrlParameters(code.redirectUrl) : {};
+  const redirectUtmParams = Object.entries(redirectParams).filter(([key]) =>
+    key.startsWith('utm_') || key === 'gclid' || key === 'fbclid' || key === 'dclid'
+  );
+  console.log('Redirect UTM params:', redirectUtmParams);
+
+  // Combine UTM params from both sources (deduplicate)
+  const embeddedUtmParams = extractUtmFromEmbeddedUrls();
+  const allUtmParams = [...embeddedUtmParams, ...redirectUtmParams];
+  const utmParams = Array.from(
+    new Map(allUtmParams.map(([k, v]) => [k, v])).entries()
+  );
+  console.log('Final combined UTM params:', utmParams);
 
   return (
     <div className="detail-overlay">
@@ -362,52 +462,88 @@ function CodeDetailPanel({ code, onClose, rootTabId, tabLookup, fallbackColor })
           <div className="detail-tags">
             <span className={`type-pill ${code.type}`}>{code.type === 'trackclk' ? 'click' : 'view'}</span>
             <span className="badge repetitions">×{code.count}</span>
-            {seenOnChild ? <span className="badge child">child tab</span> : null}
+            {!gdprValidation.hasGdpr ? (
+              <span className="badge danger">{gdprValidation.message}</span>
+            ) : null}
           </div>
           <button className="button ghost" onClick={onClose}>
             Close
           </button>
         </div>
-        <div className="detail-url">{code.url}</div>
-        <div className="detail-meta">
-          <span>First seen {formatDateTime(code.firstSeenAt)}</span>
-          <span>Last seen {formatDateTime(code.lastSeenAt)}</span>
-          {code.papiez?.lastFetchedAt ? (
-            <span>
-              Papierz {formatDateTime(code.papiez.lastFetchedAt)} ({code.papiez?.source || 'auto'})
-            </span>
-          ) : (
-            <span>Waiting for Papierz details…</span>
-          )}
-        </div>
-        <div className="detail-tabline" title={tabSummary || 'Tab lineage'}>
-          <span className="detail-tabline-title">Tabs ({tabItems.length})</span>
-          <div className="tab-origin-list">
-            {tabItems.map((item) => (
-              <div key={`${code.url}-${item.tabId}`} className="tab-origin-item">
-                <span className="tab-color-dot" style={{ backgroundColor: item.color }} />
-                <span className="tab-origin-text">{item.label}</span>
-              </div>
-            ))}
+
+        {/* Papierz Details Section - Ordered Fields */}
+        {allPapiezFields.length > 0 ? (
+          <>
+            <div className="detail-section-title">Szczegóły reklamy (Papierz)</div>
+            <table className="detail-table papierz-table">
+              <tbody>
+                {allPapiezFields.map(([key, value]) => {
+                  const isGdprField = key === 'urlgdpr';
+                  const isMissingGdpr = isGdprField && (value === null || value === undefined || value === '');
+                  return (
+                    <tr key={key} className={isMissingGdpr ? 'gdpr-missing-row' : ''}>
+                      <th>{key}</th>
+                      <td className={isMissingGdpr ? 'gdpr-missing' : ''}>
+                        {value ?? 'N/A'}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </>
+        ) : (
+          <div className="detail-pending">
+            {code.papiez?.error ? (
+              <div className="detail-error">{code.papiez.error}</div>
+            ) : (
+              <div className="detail-info">Waiting for Papierz validation…</div>
+            )}
           </div>
-        </div>
-        <div className={`detail-status ${status.tone}`}>
-          <span className={`status-dot ${status.tone}`} />
-          <span>{status.label}</span>
-        </div>
-        {code.papiez?.error ? <div className="detail-error">{code.papiez.error}</div> : null}
-        {fields.length ? (
-          <table className="detail-table">
-            <tbody>
-              {fields.map(([key, value]) => (
-                <tr key={key}>
-                  <th>{key}</th>
-                  <td>{value ?? 'N/A'}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+        )}
+
+        {/* Filtered URL Parameters (excluding duplicates shown elsewhere) */}
+        {filteredUrlParams.length > 0 ? (
+          <>
+            <div className="detail-section-title">Inne parametry</div>
+            <table className="detail-table url-params-table">
+              <tbody>
+                {filteredUrlParams.map(([key, value]) => (
+                  <tr key={key}>
+                    <th>{key}</th>
+                    <td title={value}>{value}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </>
         ) : null}
+
+        {/* UTM Parameters from redirect destination */}
+        {utmParams.length > 0 ? (
+          <>
+            <div className="detail-section-title">Parametry UTM (z przekierowania)</div>
+            <table className="detail-table url-params-table">
+              <tbody>
+                {utmParams.map(([key, value]) => (
+                  <tr key={key}>
+                    <th>{key}</th>
+                    <td title={value}>{value}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            {code.redirectUrl ? (
+              <div className="redirect-url-info">
+                Przekierowanie do: {code.redirectUrl}
+              </div>
+            ) : null}
+          </>
+        ) : null}
+
+        {/* Full URL Section */}
+        <div className="detail-section-title">Pełny URL</div>
+        <div className="detail-url-full" title={code.url}>{code.url}</div>
       </div>
     </div>
   );
@@ -423,7 +559,38 @@ export default function App() {
   const [authLoading, setAuthLoading] = useState(false);
   const [authError, setAuthError] = useState(null);
   const [selectedCodeUrl, setSelectedCodeUrl] = useState(null);
+  const [showOnlyCmCodes, setShowOnlyCmCodes] = useState(false);
   const portRef = useRef(null);
+
+  // Load saved filter on mount
+  useEffect(() => {
+    chrome.storage.local.get(FILTER_STORAGE_KEY, (result) => {
+      if (result[FILTER_STORAGE_KEY]) {
+        setFilter(result[FILTER_STORAGE_KEY]);
+      }
+    });
+  }, []);
+
+  // Save filter to storage when it changes
+  useEffect(() => {
+    if (filter !== undefined) {
+      chrome.storage.local.set({ [FILTER_STORAGE_KEY]: filter });
+    }
+  }, [filter]);
+
+  // Load saved CM codes filter on mount
+  useEffect(() => {
+    chrome.storage.local.get(CM_CODES_FILTER_KEY, (result) => {
+      if (result[CM_CODES_FILTER_KEY] !== undefined) {
+        setShowOnlyCmCodes(result[CM_CODES_FILTER_KEY]);
+      }
+    });
+  }, []);
+
+  // Save CM codes filter to storage when it changes
+  useEffect(() => {
+    chrome.storage.local.set({ [CM_CODES_FILTER_KEY]: showOnlyCmCodes });
+  }, [showOnlyCmCodes]);
 
   useEffect(() => {
     const tabId = chrome?.devtools?.inspectedWindow?.tabId;
@@ -509,18 +676,50 @@ export default function App() {
 
   const filteredRequests = useMemo(() => {
     if (!session) return [];
-    return session.requests.filter(createRequestFilter(filter));
-  }, [session, filter]);
+    let filtered = session.requests.filter(createRequestFilter(filter));
 
-  const filteredCodes = useMemo(() => {
-    if (!session) return [];
-    return session.cmCodes.filter(createCodeFilter(filter));
-  }, [session, filter]);
+    // Filter to show only CM codes (trackimp/trackclk) if enabled
+    if (showOnlyCmCodes) {
+      filtered = filtered.filter(req => req.type === 'trackimp' || req.type === 'trackclk');
+    }
+
+    return filtered;
+  }, [session, filter, showOnlyCmCodes]);
 
   const selectedCode = useMemo(() => {
     if (!session || !selectedCodeUrl) return null;
     return session.cmCodes.find((code) => code.url === selectedCodeUrl) || null;
   }, [session, selectedCodeUrl]);
+
+  // Create a map of CM codes for quick lookup
+  const cmCodesMap = useMemo(() => {
+    if (!session || !session.cmCodes) return new Map();
+    const map = new Map();
+    session.cmCodes.forEach((code) => {
+      map.set(code.url, code);
+    });
+    return map;
+  }, [session]);
+
+  // Group impression and click codes by common identifier
+  const impressionClickGroups = useMemo(() => {
+    if (!session?.cmCodes) return new Map();
+    return matchImpressionWithClick(session.cmCodes);
+  }, [session?.cmCodes]);
+
+  // Map request URL to group identifier for visual grouping
+  const requestToGroupMap = useMemo(() => {
+    const map = new Map();
+    impressionClickGroups.forEach((group, identifier) => {
+      if (group.impression) {
+        map.set(group.impression.url, identifier);
+      }
+      if (group.click) {
+        map.set(group.click.url, identifier);
+      }
+    });
+    return map;
+  }, [impressionClickGroups]);
 
   const tabsMeta = session?.tabs || [];
   const sortedTabs = useMemo(() => {
@@ -632,16 +831,14 @@ export default function App() {
 
       {error ? <div className="warning-banner">{error}</div> : null}
 
-      <AuthCard authInfo={authInfo} loading={authLoading} error={authError} onLogin={handleLogin} onLogout={handleLogout} />
-
       {session ? (
         <>
           <div className="stats-bar">
-            <span className="stat-chip">Requests: {totals.totalRequests}</span>
+            <span className="stat-chip">Total: {totals.totalRequests}</span>
             <span className="stat-chip">Ad requests: {totals.adRequests}</span>
             <span className="stat-chip">CM codes: {totals.uniqueCmCodes}</span>
-            <span className="stat-chip">Tracked tabs: {sortedTabs.length}</span>
-            <span className="stat-chip">{session.tabsWithClicks?.length ? 'User interaction detected' : 'Awaiting user click'}</span>
+            <span className="stat-chip">Tabs: {sortedTabs.length}</span>
+            <span className="stat-chip">{session.tabsWithClicks?.length ? 'User click detected ✓' : 'No user click yet'}</span>
           </div>
           <div className="tab-chip-row">
             {sortedTabs.map((tab) => {
@@ -669,7 +866,7 @@ export default function App() {
           <input
             className="filter-input"
             type="search"
-            placeholder="Filter by URL or type…"
+            placeholder="Filter by URL, Ad ID, or type…"
             value={filter}
             onChange={(event) => setFilter(event.target.value)}
           />
@@ -677,57 +874,54 @@ export default function App() {
             <input type="checkbox" checked={session?.preserveLog ?? false} onChange={handlePreserveToggle} />
             Preserve log
           </label>
+          <label className="toggle">
+            <input
+              type="checkbox"
+              checked={showOnlyCmCodes}
+              onChange={(e) => setShowOnlyCmCodes(e.target.checked)}
+            />
+            Tylko CM codes (trackimp/trackclk)
+          </label>
+          <button className="button danger" onClick={handleClear}>
+            Clear
+          </button>
         </div>
         <div className="control-right">
           <span className={autoStatusClass}>{autoStatusText}</span>
           <button className="button primary" onClick={handleCheckPapiez} disabled={!canRunPapiez || papiezState.inFlight}>
             {papiezState.inFlight ? 'Checking…' : 'Check in CM'}
           </button>
-          <button className="button danger" onClick={handleClear}>
-            Clear
-          </button>
         </div>
       </div>
 
       {papiezState.lastError ? <div className="warning-banner">{papiezState.lastError}</div> : null}
 
-      <div className="main-grid">
-        <section className="panel">
-          <header className="panel-header">
-            <h2>Request timeline</h2>
-            <span className="badge">{filteredRequests.length} shown</span>
-          </header>
-          <RequestsTable
-            requests={filteredRequests}
-            selectedUrl={selectedCodeUrl}
-            onSelectUrl={setSelectedCodeUrl}
-            tabLookup={tabLookup}
-            fallbackColor={fallbackTabColor}
-          />
-        </section>
-        <section className="panel">
-          <header className="panel-header">
-            <h2>Campaign Manager codes</h2>
-            <span className="badge">{filteredCodes.length} listed</span>
-          </header>
-          <CmCodeList
-            codes={filteredCodes}
-            selectedUrl={selectedCodeUrl}
-            onSelect={setSelectedCodeUrl}
-            rootTabId={rootTabId}
-            tabLookup={tabLookup}
-            fallbackColor={fallbackTabColor}
-          />
-        </section>
-      </div>
+      {/* Single panel layout - Network tab style */}
+      <section className="panel main-panel">
+        <header className="panel-header">
+          <h2>Request Monitor</h2>
+          <span className="badge">{filteredRequests.length} / {session?.requests?.length || 0} requests</span>
+        </header>
+        <RequestsTable
+          requests={filteredRequests}
+          selectedUrl={selectedCodeUrl}
+          onSelectUrl={setSelectedCodeUrl}
+          tabLookup={tabLookup}
+          fallbackColor={fallbackTabColor}
+          cmCodesMap={cmCodesMap}
+          requestToGroupMap={requestToGroupMap}
+          impressionClickGroups={impressionClickGroups}
+        />
+      </section>
 
+      {/* Auth card moved to bottom */}
+      <AuthCard authInfo={authInfo} loading={authLoading} error={authError} onLogin={handleLogin} onLogout={handleLogout} />
+
+      {/* Detail panel overlay */}
       {selectedCode ? (
         <CodeDetailPanel
           code={selectedCode}
           onClose={() => setSelectedCodeUrl(null)}
-          rootTabId={rootTabId}
-          tabLookup={tabLookup}
-          fallbackColor={fallbackTabColor}
         />
       ) : null}
     </div>

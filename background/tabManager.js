@@ -28,6 +28,16 @@
     }
 
     if (tabId === rootTabId) {
+      // Load preserve log preference from storage for new root sessions
+      try {
+        const stored = await chrome.storage.local.get('cm_monitor_preserve_log');
+        if (stored.cm_monitor_preserve_log !== undefined) {
+          session.preserveLog = Boolean(stored.cm_monitor_preserve_log);
+        }
+      } catch (error) {
+        console.warn('Failed to load preserve log preference:', error);
+      }
+
       await PapiezService.loadPapiezSnapshot(session);
     }
 
@@ -76,6 +86,22 @@
     }
   }
 
+  // Strict pattern matching for Campaign Manager tracking URLs
+  function isCmTrackingUrl(url) {
+    try {
+      const parsed = new URL(url);
+      // Must be ad.doubleclick.net hostname
+      if (parsed.hostname !== 'ad.doubleclick.net') return false;
+      // Pathname must start with /ddm/trackclk or /ddm/trackimp (or legacy /trackclk, /trackimp)
+      const isMatch = /^\/(ddm\/)?(trackclk|trackimp)/.test(parsed.pathname);
+      console.log('[CM Filter]', isMatch ? '✓' : '✗', 'hostname:', parsed.hostname, 'pathname:', parsed.pathname);
+      return isMatch;
+    } catch (error) {
+      console.warn('[CM Filter] Invalid URL:', url, error);
+      return false;
+    }
+  }
+
   function handleNetworkRequest(details) {
     if (!details || details.tabId === -1) return;
 
@@ -87,7 +113,7 @@
 
     const url = details.url;
     const isAdRequest = url.includes('ad.d') || url.includes('doubleclick');
-    const isGoogleCm = url.includes('ad.doubleclick.net') && (url.includes('trackimp') || url.includes('trackclk'));
+    const isGoogleCm = isCmTrackingUrl(url);
     const cmType = isGoogleCm ? (url.includes('trackclk') ? 'trackclk' : 'trackimp') : 'general';
 
     session.totalRequests += 1;
@@ -139,10 +165,28 @@
       timelineFlag,
       isChildRequest: details.tabId !== rootTabId,
       tabColor: SessionStore.getTabColor(session, details.tabId),
+      statusCode: null, // Will be populated by onCompleted
     };
 
     session.requests.push(entry);
     SessionStore.broadcastSessionUpdate(rootTabId);
+  }
+
+  function handleRequestCompleted(details) {
+    if (!details || details.tabId === -1) return;
+
+    const rootTabId = SessionStore.getRootForTab(details.tabId);
+    if (rootTabId === undefined) return;
+
+    const session = SessionStore.getSession(rootTabId);
+    if (!session) return;
+
+    // Find the request entry by requestId and update status code
+    const entry = session.requests.find((req) => req.id === details.requestId);
+    if (entry) {
+      entry.statusCode = details.statusCode || null;
+      SessionStore.broadcastSessionUpdate(rootTabId);
+    }
   }
 
   function handlePageClick(tabId) {
@@ -155,10 +199,73 @@
     SessionStore.broadcastSessionUpdate(rootTabId);
   }
 
+  function handleRequestRedirect(details) {
+    console.log('=== REDIRECT DETECTED ===');
+    console.log('From URL:', details.url);
+    console.log('To URL:', details.redirectUrl);
+    console.log('Tab ID:', details.tabId);
+    console.log('Status Code:', details.statusCode);
+
+    const rootTabId = SessionStore.getRootForTab(details.tabId);
+    console.log('Root Tab ID:', rootTabId);
+    if (rootTabId === undefined) {
+      console.log('❌ No root tab found, ignoring redirect');
+      console.log('========================');
+      return;
+    }
+
+    const session = SessionStore.getSession(rootTabId);
+    if (!session) {
+      console.log('❌ No session found, ignoring redirect');
+      console.log('========================');
+      return;
+    }
+
+    const url = details.url;
+    const redirectUrl = details.redirectUrl;
+
+    // Check if this is a CM tracking code redirect
+    const isDoubleClickRedirect = url.includes('doubleclick.net/ddm/track');
+    console.log('Is DoubleClick redirect?', isDoubleClickRedirect);
+
+    if (isDoubleClickRedirect) {
+      console.log('Available CM codes:', Array.from(session.cmCodes.keys()));
+
+      // Store redirect destination for this CM code
+      const cmCode = session.cmCodes.get(url);
+      console.log('Found CM code in session?', !!cmCode);
+
+      if (cmCode) {
+        console.log('✓ Storing redirect URL for CM code:', url);
+        cmCode.redirectUrl = redirectUrl;
+        SessionStore.broadcastSessionUpdate(rootTabId);
+      } else {
+        console.log('❌ CM code not found in session for URL:', url);
+      }
+    }
+    console.log('========================');
+  }
+
   function initializeEventListeners() {
     chrome.webRequest.onBeforeRequest.addListener(
       (details) => {
         handleNetworkRequest(details);
+      },
+      { urls: ['<all_urls>'] }
+    );
+
+    // Track HTTP status codes on completion
+    chrome.webRequest.onCompleted.addListener(
+      (details) => {
+        handleRequestCompleted(details);
+      },
+      { urls: ['<all_urls>'] }
+    );
+
+    // Track redirects to capture final landing page URLs
+    chrome.webRequest.onBeforeRedirect.addListener(
+      (details) => {
+        handleRequestRedirect(details);
       },
       { urls: ['<all_urls>'] }
     );

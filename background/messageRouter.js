@@ -35,6 +35,10 @@
           const session = SessionStore.getSession(trackedRootTabId);
           if (!session) return;
           session.preserveLog = Boolean(message.value);
+          // Persist preserve log preference to storage
+          chrome.storage.local.set({ cm_monitor_preserve_log: session.preserveLog }).catch((error) => {
+            console.warn('Failed to save preserve log preference:', error);
+          });
           if (!session.preserveLog) {
             SessionStore.resetSessionData(session, { forgetClicks: true });
           }

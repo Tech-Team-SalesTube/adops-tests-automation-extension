@@ -131,6 +131,7 @@
       timelineFlag: entry.timelineFlag,
       isChildRequest: entry.isChildRequest,
       tabColor: entry.tabColor,
+      statusCode: entry.statusCode,
     }));
 
     const cmCodePayload = Array.from(session.cmCodes.entries()).map(([url, summary]) => ({
@@ -139,6 +140,7 @@
       type: summary.type,
       firstSeenAt: summary.firstSeenAt,
       lastSeenAt: summary.lastSeenAt,
+      redirectUrl: summary.redirectUrl || null,
       originTabs: summary.originTabs ? Array.from(summary.originTabs.values()) : [],
       papiez: summary.papiez
         ? {
