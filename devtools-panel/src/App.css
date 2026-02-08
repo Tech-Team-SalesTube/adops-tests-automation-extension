@@ -830,6 +830,17 @@
   color: var(--text-muted);
 }
 
+.simple-view-url {
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-primary);
+  font-family: 'Courier New', monospace;
+}
+
+.simple-view-url div {
+  white-space: nowrap;
+}
+
 .detail-overlay::-webkit-scrollbar,
 .code-list::-webkit-scrollbar,
 .table-wrapper::-webkit-scrollbar {

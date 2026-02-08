@@ -6,6 +6,7 @@ const DEFAULT_TAB_COLOR = '#94a3b8';
 
 const FILTER_STORAGE_KEY = 'cm_monitor_filter_settings';
 const CM_CODES_FILTER_KEY = 'cm_monitor_show_only_cm_codes';
+const SIMPLE_VIEW_STORAGE_KEY = 'cm_monitor_simple_view';
 
 // Ordered fields for Papierz display
 const PAPIERZ_FIELD_ORDER = [
@@ -152,6 +153,78 @@ function matchImpressionWithClick(codes) {
   return groups;
 }
 
+// Extract 4 key parameters for Simple View grouping
+function extractSimpleViewParams(url) {
+  try {
+    const parsed = new URL(url);
+    const params = parseUrlParameters(url);
+
+    // Extract pathname segment (e.g., /ddm/trackclk/B34731285.436535728)
+    const pathSegment = parsed.pathname;
+
+    // Extract /B... segment
+    const bMatch = pathSegment.match(/\/(B\d+\.\d+)/);
+    const bSegment = bMatch ? `/${bMatch[1]}` : '—';
+
+    return {
+      bSegment,
+      dc_trk_aid: params.dc_trk_aid || '—',
+      dc_trk_cid: params.dc_trk_cid || '—',
+      ord: params.ord || '—',
+    };
+  } catch (error) {
+    return {
+      bSegment: '—',
+      dc_trk_aid: '—',
+      dc_trk_cid: '—',
+      ord: '—',
+    };
+  }
+}
+
+// Group requests by Simple View parameters (4-tuple identifier)
+function groupRequestsBySimpleViewParams(requests) {
+  const groups = new Map();
+
+  requests.forEach((request) => {
+    const params = extractSimpleViewParams(request.url);
+    const key = `${params.bSegment}|${params.dc_trk_aid}|${params.dc_trk_cid}|${params.ord}`;
+
+    if (!groups.has(key)) {
+      groups.set(key, { params, requests: [] });
+    }
+
+    groups.get(key).requests.push(request);
+  });
+
+  return groups;
+}
+
+// Select best request from a group (prefer status 200, then highest status, then first)
+function selectBestRequestFromGroup(requests) {
+  if (requests.length === 1) return requests[0];
+
+  // Priority: status 200 > other status codes > no status (—)
+
+  // Look for request with status 200
+  const status200 = requests.find(r => r.statusCode === 200 || r.statusCode === '200');
+  if (status200) return status200;
+
+  // If no 200, select the one with highest status code
+  const withStatus = requests.filter(r => r.statusCode && r.statusCode !== '—');
+  if (withStatus.length > 0) {
+    withStatus.sort((a, b) => {
+      const aCode = parseInt(a.statusCode) || 0;
+      const bCode = parseInt(b.statusCode) || 0;
+      return bCode - aCode;
+    });
+    return withStatus[0];
+  }
+
+  // If all have status "—", return first
+  return requests[0];
+}
+
 function withOpacity(color, alpha) {
   if (!color || typeof color !== 'string') {
     return `rgba(148, 163, 184, ${alpha})`;
@@ -248,7 +321,7 @@ function AuthCard({ authInfo, loading, error, onLogin, onLogout }) {
   );
 }
 
-function RequestsTable({ requests, selectedUrl, onSelectUrl, tabLookup, fallbackColor, cmCodesMap, requestToGroupMap, impressionClickGroups }) {
+function RequestsTable({ requests, selectedUrl, onSelectUrl, tabLookup, fallbackColor, cmCodesMap, requestToGroupMap, impressionClickGroups, simpleViewMode }) {
   if (!requests.length) {
     return <div className="empty-state">No matching requests observed yet.</div>;
   }
@@ -359,7 +432,16 @@ function RequestsTable({ requests, selectedUrl, onSelectUrl, tabLookup, fallback
                 </td>
                 <td>{formatTimestamp(request.timestamp)}</td>
                 <td className="url-cell truncate-cell" title={request.url}>
-                  {request.url}
+                  {simpleViewMode && request._simpleViewParams ? (
+                    <div className="simple-view-url">
+                      <div>{request._simpleViewParams.bSegment}</div>
+                      <div>dc_trk_aid={request._simpleViewParams.dc_trk_aid}</div>
+                      <div>dc_trk_cid={request._simpleViewParams.dc_trk_cid}</div>
+                      <div>ord={request._simpleViewParams.ord}</div>
+                    </div>
+                  ) : (
+                    request.url
+                  )}
                 </td>
               </tr>
             );
@@ -560,6 +642,7 @@ export default function App() {
   const [authError, setAuthError] = useState(null);
   const [selectedCodeUrl, setSelectedCodeUrl] = useState(null);
   const [showOnlyCmCodes, setShowOnlyCmCodes] = useState(false);
+  const [simpleViewMode, setSimpleViewMode] = useState(false);
   const portRef = useRef(null);
 
   // Load saved filter on mount
@@ -591,6 +674,20 @@ export default function App() {
   useEffect(() => {
     chrome.storage.local.set({ [CM_CODES_FILTER_KEY]: showOnlyCmCodes });
   }, [showOnlyCmCodes]);
+
+  // Load saved Simple View mode on mount
+  useEffect(() => {
+    chrome.storage.local.get(SIMPLE_VIEW_STORAGE_KEY, (result) => {
+      if (result[SIMPLE_VIEW_STORAGE_KEY] !== undefined) {
+        setSimpleViewMode(result[SIMPLE_VIEW_STORAGE_KEY]);
+      }
+    });
+  }, []);
+
+  // Save Simple View mode to storage when it changes
+  useEffect(() => {
+    chrome.storage.local.set({ [SIMPLE_VIEW_STORAGE_KEY]: simpleViewMode });
+  }, [simpleViewMode]);
 
   useEffect(() => {
     const tabId = chrome?.devtools?.inspectedWindow?.tabId;
@@ -674,6 +771,16 @@ export default function App() {
     }
   }, [session, selectedCodeUrl]);
 
+  // Create a map of CM codes for quick lookup (MUST BE BEFORE filteredRequests)
+  const cmCodesMap = useMemo(() => {
+    if (!session || !session.cmCodes) return new Map();
+    const map = new Map();
+    session.cmCodes.forEach((code) => {
+      map.set(code.url, code);
+    });
+    return map;
+  }, [session]);
+
   const filteredRequests = useMemo(() => {
     if (!session) return [];
     let filtered = session.requests.filter(createRequestFilter(filter));
@@ -683,23 +790,41 @@ export default function App() {
       filtered = filtered.filter(req => req.type === 'trackimp' || req.type === 'trackclk');
     }
 
+    // Simple View Mode: filter out "No data returned" and deduplicate
+    if (simpleViewMode) {
+      // 1. Filter out requests without Papierz data
+      filtered = filtered.filter(req => {
+        if (!req.isCmCode) return true; // Keep non-CM codes
+
+        const cmCode = cmCodesMap.get(req.url);
+        if (!cmCode) return true; // Keep if no CM code data
+
+        // Filter out if error is "No data returned from Papierz."
+        const hasNoData = cmCode.papiez?.error === 'No data returned from Papierz.';
+        return !hasNoData;
+      });
+
+      // 2. Group by 4 parameters and select best from each group
+      const groups = groupRequestsBySimpleViewParams(filtered);
+      const deduplicated = [];
+
+      groups.forEach((group) => {
+        const bestRequest = selectBestRequestFromGroup(group.requests);
+        // Attach simple view params to request for rendering
+        bestRequest._simpleViewParams = group.params;
+        deduplicated.push(bestRequest);
+      });
+
+      filtered = deduplicated;
+    }
+
     return filtered;
-  }, [session, filter, showOnlyCmCodes]);
+  }, [session, filter, showOnlyCmCodes, simpleViewMode, cmCodesMap]);
 
   const selectedCode = useMemo(() => {
     if (!session || !selectedCodeUrl) return null;
     return session.cmCodes.find((code) => code.url === selectedCodeUrl) || null;
   }, [session, selectedCodeUrl]);
-
-  // Create a map of CM codes for quick lookup
-  const cmCodesMap = useMemo(() => {
-    if (!session || !session.cmCodes) return new Map();
-    const map = new Map();
-    session.cmCodes.forEach((code) => {
-      map.set(code.url, code);
-    });
-    return map;
-  }, [session]);
 
   // Group impression and click codes by common identifier
   const impressionClickGroups = useMemo(() => {
@@ -882,6 +1007,14 @@ export default function App() {
             />
             Tylko CM codes (trackimp/trackclk)
           </label>
+          <label className="toggle">
+            <input
+              type="checkbox"
+              checked={simpleViewMode}
+              onChange={(e) => setSimpleViewMode(e.target.checked)}
+            />
+            Simple view
+          </label>
           <button className="button danger" onClick={handleClear}>
             Clear
           </button>
@@ -911,6 +1044,7 @@ export default function App() {
           cmCodesMap={cmCodesMap}
           requestToGroupMap={requestToGroupMap}
           impressionClickGroups={impressionClickGroups}
+          simpleViewMode={simpleViewMode}
         />
       </section>
 
