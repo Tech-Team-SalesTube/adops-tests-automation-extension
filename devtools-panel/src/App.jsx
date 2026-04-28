@@ -7,6 +7,20 @@ const DEFAULT_TAB_COLOR = '#94a3b8';
 const FILTER_STORAGE_KEY = 'cm_monitor_filter_settings';
 const CM_CODES_FILTER_KEY = 'cm_monitor_show_only_cm_codes';
 const SIMPLE_VIEW_STORAGE_KEY = 'cm_monitor_simple_view';
+const COLUMN_STORAGE_KEY = 'cm_monitor_column_widths';
+const DEFAULT_COLUMN_WIDTHS = {
+  type: 140,
+  adId: 120,
+  url: 400,
+  gdpr: 80,
+  status: 80,
+  duplicates: 100,
+  time: 100,
+};
+const PANEL_WIDTH_STORAGE_KEY = 'cm_monitor_panel_width';
+const DEFAULT_PANEL_WIDTH = 420;
+const MIN_PANEL_WIDTH = 280;
+const MAX_PANEL_WIDTH = 800;
 
 // Ordered fields for Papierz display
 const PAPIERZ_FIELD_ORDER = [
@@ -61,52 +75,37 @@ function formatTabLabel(url) {
   }
 }
 
-// Extract Ad ID from Campaign Manager URL
 function extractAdId(url) {
   if (!url) return '—';
   try {
-    // Use parseUrlParameters to handle both ? and ; separated params
+    // parseUrlParameters handles both `?` and `;`-separated params (DoubleClick uses `;`).
     const params = parseUrlParameters(url);
-
-    // Try to extract from 'ad' parameter
-    if (params.ad) return params.ad;
-
-    // Try Campaign Manager tracking aid parameter
-    if (params.trk_aid) return params.trk_aid;
-
-    // Try DoubleClick tracking aid parameter
-    if (params.dc_trk_aid) return params.dc_trk_aid;
-
-    return '—';
+    return params.ad || params.trk_aid || params.dc_trk_aid || '—';
   } catch (error) {
     return '—';
   }
 }
 
-// Parse all URL parameters (both ? query params and ; semicolon params)
+// Parses both `?key=value&...` query params and `;key=value;...` semicolon params.
+// DoubleClick/CM URLs put tracking params after a semicolon, e.g.
+// `https://ad.doubleclick.net/ddm/trackclk/B123.456;dc_trk_aid=789;dc_trk_cid=1;gdpr=1`.
 function parseUrlParameters(url) {
   if (!url) return {};
   try {
     const params = {};
 
-    // Parse standard query parameters (?key=value&key2=value2)
     const parsed = new URL(url);
     parsed.searchParams.forEach((value, key) => {
       params[key] = value;
     });
 
-    // Parse semicolon-separated parameters (common in DoubleClick URLs)
-    // Example: ;dc_trk_aid=123;dc_trk_cid=456;gdpr=1
-    const urlString = url.split('?')[0]; // Get part before ? (if any)
-    const semicolonParts = urlString.split(';');
-
+    const beforeQuery = url.split('?')[0];
+    const semicolonParts = beforeQuery.split(';');
     for (let i = 1; i < semicolonParts.length; i++) {
       const part = semicolonParts[i];
       const equalIndex = part.indexOf('=');
       if (equalIndex > 0) {
-        const key = part.substring(0, equalIndex);
-        const value = part.substring(equalIndex + 1);
-        params[key] = value;
+        params[part.substring(0, equalIndex)] = part.substring(equalIndex + 1);
       }
     }
 
@@ -116,7 +115,6 @@ function parseUrlParameters(url) {
   }
 }
 
-// Check if GDPR is present and valid
 function validateGdprPresence(papiezData) {
   if (!papiezData) return { hasGdpr: true, message: null };
 
@@ -128,14 +126,13 @@ function validateGdprPresence(papiezData) {
   return { hasGdpr: true, message: null };
 }
 
-// Match impression and click codes by common identifier
+// Pair impression/click codes that belong to the same creative or placement,
+// falling back to the URL itself when no shared identifier is present.
 function matchImpressionWithClick(codes) {
-  // Group codes by a common identifier (e.g., creative ID or placement ID)
   const groups = new Map();
 
   codes.forEach((code) => {
     const params = parseUrlParameters(code.url);
-    // Try multiple possible identifiers
     const identifier = params.dc_trk_cid || params.trk_aid || params.dc_trk_aid || params.cid || code.url;
 
     if (!groups.has(identifier)) {
@@ -153,17 +150,14 @@ function matchImpressionWithClick(codes) {
   return groups;
 }
 
-// Extract 4 key parameters for Simple View grouping
+// Returns the 4 fields that Simple View uses to deduplicate requests:
+// the `/B<advertiser>.<placement>` path segment plus dc_trk_aid/dc_trk_cid/ord.
 function extractSimpleViewParams(url) {
   try {
     const parsed = new URL(url);
     const params = parseUrlParameters(url);
 
-    // Extract pathname segment (e.g., /ddm/trackclk/B34731285.436535728)
-    const pathSegment = parsed.pathname;
-
-    // Extract /B... segment
-    const bMatch = pathSegment.match(/\/(B\d+\.\d+)/);
+    const bMatch = parsed.pathname.match(/\/(B\d+\.\d+)/);
     const bSegment = bMatch ? `/${bMatch[1]}` : '—';
 
     return {
@@ -182,13 +176,14 @@ function extractSimpleViewParams(url) {
   }
 }
 
-// Group requests by Simple View parameters (4-tuple identifier)
+// Groups requests by (type, bSegment, dc_trk_aid, dc_trk_cid, ord). `type` is part
+// of the key so an impression and a click with otherwise identical params stay separate.
 function groupRequestsBySimpleViewParams(requests) {
   const groups = new Map();
 
   requests.forEach((request) => {
     const params = extractSimpleViewParams(request.url);
-    const key = `${params.bSegment}|${params.dc_trk_aid}|${params.dc_trk_cid}|${params.ord}`;
+    const key = `${request.type}|${params.bSegment}|${params.dc_trk_aid}|${params.dc_trk_cid}|${params.ord}`;
 
     if (!groups.has(key)) {
       groups.set(key, { params, requests: [] });
@@ -200,17 +195,14 @@ function groupRequestsBySimpleViewParams(requests) {
   return groups;
 }
 
-// Select best request from a group (prefer status 200, then highest status, then first)
+// Picks one representative from a Simple View group.
+// Priority: status 200 > highest known status > first request.
 function selectBestRequestFromGroup(requests) {
   if (requests.length === 1) return requests[0];
 
-  // Priority: status 200 > other status codes > no status (—)
-
-  // Look for request with status 200
   const status200 = requests.find(r => r.statusCode === 200 || r.statusCode === '200');
   if (status200) return status200;
 
-  // If no 200, select the one with highest status code
   const withStatus = requests.filter(r => r.statusCode && r.statusCode !== '—');
   if (withStatus.length > 0) {
     withStatus.sort((a, b) => {
@@ -221,7 +213,6 @@ function selectBestRequestFromGroup(requests) {
     return withStatus[0];
   }
 
-  // If all have status "—", return first
   return requests[0];
 }
 
@@ -267,6 +258,102 @@ function resolveStatusClass(status) {
   if (status === 'connecting' || status === 'idle') return 'status-pill idle';
   if (status === 'disconnected' || status === 'ended') return 'status-pill error';
   return 'status-pill';
+}
+
+function useColumnResize(columnKey, initialWidth, onWidthChange) {
+  const [isResizing, setIsResizing] = useState(false);
+  const startXRef = useRef(0);
+  const startWidthRef = useRef(initialWidth);
+
+  const handleMouseDown = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsResizing(true);
+    startXRef.current = e.clientX;
+    startWidthRef.current = initialWidth;
+  };
+
+  useEffect(() => {
+    if (!isResizing) return;
+
+    const handleMouseMove = (e) => {
+      document.body.classList.add('resizing-column');
+      const delta = e.clientX - startXRef.current;
+      const newWidth = Math.max(50, startWidthRef.current + delta);
+      onWidthChange(columnKey, newWidth);
+    };
+
+    const handleMouseUp = () => {
+      document.body.classList.remove('resizing-column');
+      setIsResizing(false);
+    };
+
+    document.addEventListener('mousemove', handleMouseMove);
+    document.addEventListener('mouseup', handleMouseUp);
+
+    return () => {
+      document.removeEventListener('mousemove', handleMouseMove);
+      document.removeEventListener('mouseup', handleMouseUp);
+    };
+  }, [isResizing, columnKey, onWidthChange]);
+
+  return { handleMouseDown, isResizing };
+}
+
+function ColumnResizeHandle({ columnKey, onResize, currentWidth }) {
+  const { handleMouseDown, isResizing } = useColumnResize(
+    columnKey,
+    currentWidth,
+    onResize
+  );
+
+  return (
+    <div
+      className={`resize-handle ${isResizing ? 'resizing' : ''}`}
+      onMouseDown={handleMouseDown}
+      title="Drag to resize column"
+    />
+  );
+}
+
+function usePanelResize(initialWidth, minWidth, maxWidth, onWidthChange) {
+  const [isResizing, setIsResizing] = useState(false);
+  const startXRef = useRef(0);
+  const startWidthRef = useRef(initialWidth);
+
+  const handleMouseDown = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsResizing(true);
+    startXRef.current = e.clientX;
+    startWidthRef.current = initialWidth;
+  };
+
+  useEffect(() => {
+    if (!isResizing) return;
+
+    const handleMouseMove = (e) => {
+      document.body.classList.add('resizing-panel');
+      const delta = startXRef.current - e.clientX;
+      const newWidth = Math.min(maxWidth, Math.max(minWidth, startWidthRef.current + delta));
+      onWidthChange(newWidth);
+    };
+
+    const handleMouseUp = () => {
+      document.body.classList.remove('resizing-panel');
+      setIsResizing(false);
+    };
+
+    document.addEventListener('mousemove', handleMouseMove);
+    document.addEventListener('mouseup', handleMouseUp);
+
+    return () => {
+      document.removeEventListener('mousemove', handleMouseMove);
+      document.removeEventListener('mouseup', handleMouseUp);
+    };
+  }, [isResizing, minWidth, maxWidth, onWidthChange]);
+
+  return { handleMouseDown, isResizing };
 }
 
 function createRequestFilter(term) {
@@ -321,7 +408,7 @@ function AuthCard({ authInfo, loading, error, onLogin, onLogout }) {
   );
 }
 
-function RequestsTable({ requests, selectedUrl, onSelectUrl, tabLookup, fallbackColor, cmCodesMap, requestToGroupMap, impressionClickGroups, simpleViewMode }) {
+function RequestsTable({ requests, selectedUrl, onSelectUrl, tabLookup, fallbackColor, cmCodesMap, requestToGroupMap, simpleViewMode, columnWidths, onColumnResize }) {
   if (!requests.length) {
     return <div className="empty-state">No matching requests observed yet.</div>;
   }
@@ -334,13 +421,34 @@ function RequestsTable({ requests, selectedUrl, onSelectUrl, tabLookup, fallback
       <table className="request-table">
         <thead>
           <tr>
-            <th>Type</th>
-            <th>Ad ID</th>
-            <th>GDPR</th>
-            <th>Status</th>
-            <th>Duplicates</th>
-            <th>Time</th>
-            <th>URL</th>
+            <th style={{ width: `${columnWidths.type}px`, position: 'relative' }}>
+              Type
+              <ColumnResizeHandle columnKey="type" onResize={onColumnResize} currentWidth={columnWidths.type} />
+            </th>
+            <th style={{ width: `${columnWidths.adId}px`, position: 'relative' }}>
+              Ad ID
+              <ColumnResizeHandle columnKey="adId" onResize={onColumnResize} currentWidth={columnWidths.adId} />
+            </th>
+            <th style={{ width: `${columnWidths.url}px`, position: 'relative' }}>
+              URL
+              <ColumnResizeHandle columnKey="url" onResize={onColumnResize} currentWidth={columnWidths.url} />
+            </th>
+            <th style={{ width: `${columnWidths.gdpr}px`, position: 'relative' }}>
+              GDPR
+              <ColumnResizeHandle columnKey="gdpr" onResize={onColumnResize} currentWidth={columnWidths.gdpr} />
+            </th>
+            <th style={{ width: `${columnWidths.status}px`, position: 'relative' }}>
+              Status
+              <ColumnResizeHandle columnKey="status" onResize={onColumnResize} currentWidth={columnWidths.status} />
+            </th>
+            <th style={{ width: `${columnWidths.duplicates}px`, position: 'relative' }}>
+              Duplicates
+              <ColumnResizeHandle columnKey="duplicates" onResize={onColumnResize} currentWidth={columnWidths.duplicates} />
+            </th>
+            <th style={{ width: `${columnWidths.time}px`, position: 'relative' }}>
+              Time
+              <ColumnResizeHandle columnKey="time" onResize={onColumnResize} currentWidth={columnWidths.time} />
+            </th>
           </tr>
         </thead>
         <tbody>
@@ -348,11 +456,10 @@ function RequestsTable({ requests, selectedUrl, onSelectUrl, tabLookup, fallback
             const isSelectable = request.isCmCode;
             const isSelected = isSelectable && selectedUrl === request.url;
 
-            // Get CM code data for GDPR check
             const cmCode = cmCodesMap?.get(request.url);
             const gdprValidation = cmCode?.papiez?.data ? validateGdprPresence(cmCode.papiez.data) : { hasGdpr: true, message: null };
 
-            // Check if this is the first request in a group (for visual separator)
+            // First row of an impression/click pair gets a visual separator border-top.
             const groupId = requestToGroupMap?.get(request.url);
             const prevRequest = index > 0 ? requests[index - 1] : null;
             const prevGroupId = prevRequest ? requestToGroupMap?.get(prevRequest.url) : null;
@@ -393,7 +500,7 @@ function RequestsTable({ requests, selectedUrl, onSelectUrl, tabLookup, fallback
                 }}
                 title={request.url}
               >
-                <td>
+                <td style={{ width: `${columnWidths.type}px` }}>
                   <div className="type-cell">
                     <div className="type-row">
                       <span
@@ -401,48 +508,48 @@ function RequestsTable({ requests, selectedUrl, onSelectUrl, tabLookup, fallback
                         style={{ backgroundColor: accentColor }}
                         title={label}
                       />
-                      <span className={`type-pill ${request.type}`}>
-                        {request.type === 'general' ? 'other' : request.type}
+                      <span className={`type-pill ${request.type}`} title={request.type}>
+                        {request.type === 'trackimp' ? '👁️' : request.type === 'trackclk' ? '🖱️' : request.type === 'general' ? 'other' : request.type}
                       </span>
                       {request.isChildRequest ? <span className="badge child">child tab</span> : null}
                     </div>
                   </div>
                 </td>
-                <td className="truncate-cell" title={adId}>
+                <td style={{ width: `${columnWidths.adId}px` }} className="truncate-cell" title={adId}>
                   {adId}
                 </td>
-                <td>
+                <td style={{ width: `${columnWidths.url}px` }} className="url-cell" title={request.url}>
+                  {simpleViewMode && request._simpleViewParams ? (
+                    <div className="simple-view-url">
+                      <span>{request._simpleViewParams.bSegment}</span>
+                      <span>dc_trk_aid={request._simpleViewParams.dc_trk_aid}</span>
+                      <span>dc_trk_cid={request._simpleViewParams.dc_trk_cid}</span>
+                      <span>ord={request._simpleViewParams.ord}</span>
+                    </div>
+                  ) : (
+                    request.url
+                  )}
+                </td>
+                <td style={{ width: `${columnWidths.gdpr}px` }}>
                   {!gdprValidation.hasGdpr ? (
                     <span className="badge danger">{gdprValidation.message}</span>
                   ) : (
                     <span className="small-text">✓</span>
                   )}
                 </td>
-                <td>
+                <td style={{ width: `${columnWidths.status}px` }}>
                   <span className={`badge ${statusCode === '302' ? 'warning' : ''}`}>
                     {statusCode}
                   </span>
                 </td>
-                <td>
+                <td style={{ width: `${columnWidths.duplicates}px` }}>
                   {request.duplicateCount > 1 ? (
                     <span className="badge danger">×{request.duplicateCount}</span>
                   ) : (
                     <span className="small-text">—</span>
                   )}
                 </td>
-                <td>{formatTimestamp(request.timestamp)}</td>
-                <td className="url-cell truncate-cell" title={request.url}>
-                  {simpleViewMode && request._simpleViewParams ? (
-                    <div className="simple-view-url">
-                      <div>{request._simpleViewParams.bSegment}</div>
-                      <div>dc_trk_aid={request._simpleViewParams.dc_trk_aid}</div>
-                      <div>dc_trk_cid={request._simpleViewParams.dc_trk_cid}</div>
-                      <div>ord={request._simpleViewParams.ord}</div>
-                    </div>
-                  ) : (
-                    request.url
-                  )}
-                </td>
+                <td style={{ width: `${columnWidths.time}px` }}>{formatTimestamp(request.timestamp)}</td>
               </tr>
             );
           })}
@@ -453,22 +560,26 @@ function RequestsTable({ requests, selectedUrl, onSelectUrl, tabLookup, fallback
 }
 
 
-function CodeDetailPanel({ code, onClose }) {
-  const urlParams = parseUrlParameters(code.url);
-  const gdprValidation = code.papiez?.data ? validateGdprPresence(code.papiez.data) : { hasGdpr: true, message: null };
+function CodeDetailPanel({ code, onClose, panelWidth, onPanelResize }) {
+  const { handleMouseDown, isResizing } = usePanelResize(
+    panelWidth,
+    MIN_PANEL_WIDTH,
+    MAX_PANEL_WIDTH,
+    onPanelResize
+  );
 
-  // Order Papierz fields according to PAPIERZ_FIELD_ORDER
+  const urlParams = parseUrlParameters(code.url);
+
   const papiezData = code.papiez?.data || {};
   const orderedFields = [];
   const remainingFields = [];
 
   PAPIERZ_FIELD_ORDER.forEach((fieldName) => {
-    if (papiezData.hasOwnProperty(fieldName)) {
+    if (Object.prototype.hasOwnProperty.call(papiezData, fieldName)) {
       orderedFields.push([fieldName, papiezData[fieldName]]);
     }
   });
 
-  // Add remaining fields that are not in the ordered list
   Object.entries(papiezData).forEach(([key, value]) => {
     if (!PAPIERZ_FIELD_ORDER.includes(key)) {
       remainingFields.push([key, value]);
@@ -477,155 +588,127 @@ function CodeDetailPanel({ code, onClose }) {
 
   const allPapiezFields = [...orderedFields, ...remainingFields];
 
-  // Filter URL parameters to exclude those already shown in other sections
   const filteredUrlParams = Object.entries(urlParams).filter(
     ([key]) => !EXCLUDED_FROM_OTHER_PARAMS.has(key)
   );
 
-  // Extract UTM parameters from embedded URLs (like u1, u2, u3, url, destination)
-  const extractUtmFromEmbeddedUrls = () => {
-    console.log('=== UTM EXTRACTION DEBUG ===');
-    console.log('CM Code URL:', code.url);
-    console.log('All URL params:', urlParams);
+  const isUtmKey = (key) =>
+    key.startsWith('utm_') || key === 'gclid' || key === 'fbclid' || key === 'dclid';
 
+  // CM/DoubleClick wrap landing URLs in `u1`/`u2`/`url`/`destination`/etc. Decode each
+  // and surface UTM-like params from inside, so the user can see attribution data
+  // without manually unpacking the redirect chain.
+  const extractUtmFromEmbeddedUrls = () => {
     const utmParams = [];
     const urlContainingParams = ['u1', 'u2', 'u3', 'u4', 'u5', 'url', 'destination', 'redirect_url', 'landing_url'];
 
     for (const paramName of urlContainingParams) {
-      if (urlParams[paramName]) {
-        console.log(`Found ${paramName} parameter:`, urlParams[paramName]);
-        try {
-          // Decode the URL (might be URL-encoded)
-          const decodedUrl = decodeURIComponent(urlParams[paramName]);
-          console.log(`Decoded ${paramName}:`, decodedUrl);
-
-          // Parse parameters from the embedded URL
-          const embeddedParams = parseUrlParameters(decodedUrl);
-          console.log(`Parsed params from ${paramName}:`, embeddedParams);
-
-          // Extract UTM and tracking parameters
-          Object.entries(embeddedParams).forEach(([key, value]) => {
-            if (key.startsWith('utm_') || key === 'gclid' || key === 'fbclid' || key === 'dclid') {
-              console.log(`Found UTM param: ${key} = ${value}`);
-              utmParams.push([key, value]);
-            }
-          });
-        } catch (e) {
-          console.warn(`Failed to decode ${paramName}:`, e);
-        }
+      if (!urlParams[paramName]) continue;
+      try {
+        const decodedUrl = decodeURIComponent(urlParams[paramName]);
+        const embeddedParams = parseUrlParameters(decodedUrl);
+        Object.entries(embeddedParams).forEach(([key, value]) => {
+          if (isUtmKey(key)) utmParams.push([key, value]);
+        });
+      } catch (e) {
+        console.warn(`Failed to decode ${paramName}:`, e);
       }
     }
 
-    console.log('Extracted UTM params:', utmParams);
-    console.log('===========================');
     return utmParams;
   };
 
-  // Also check for UTM params from HTTP redirect (if available)
-  console.log('Checking redirect URL:', code.redirectUrl);
+  // Second UTM source: params captured from the actual HTTP redirect target,
+  // when the background page recorded one.
   const redirectParams = code.redirectUrl ? parseUrlParameters(code.redirectUrl) : {};
-  const redirectUtmParams = Object.entries(redirectParams).filter(([key]) =>
-    key.startsWith('utm_') || key === 'gclid' || key === 'fbclid' || key === 'dclid'
-  );
-  console.log('Redirect UTM params:', redirectUtmParams);
+  const redirectUtmParams = Object.entries(redirectParams).filter(([key]) => isUtmKey(key));
 
-  // Combine UTM params from both sources (deduplicate)
-  const embeddedUtmParams = extractUtmFromEmbeddedUrls();
-  const allUtmParams = [...embeddedUtmParams, ...redirectUtmParams];
   const utmParams = Array.from(
-    new Map(allUtmParams.map(([k, v]) => [k, v])).entries()
+    new Map([...extractUtmFromEmbeddedUrls(), ...redirectUtmParams]).entries()
   );
-  console.log('Final combined UTM params:', utmParams);
 
   return (
-    <div className="detail-overlay">
-      <div className="detail-panel">
-        <div className="detail-header">
-          <div className="detail-tags">
-            <span className={`type-pill ${code.type}`}>{code.type === 'trackclk' ? 'click' : 'view'}</span>
-            <span className="badge repetitions">×{code.count}</span>
-            {!gdprValidation.hasGdpr ? (
-              <span className="badge danger">{gdprValidation.message}</span>
-            ) : null}
-          </div>
-          <button className="button ghost" onClick={onClose}>
-            Close
-          </button>
-        </div>
+    <div
+      className={`detail-overlay ${isResizing ? 'resizing' : ''}`}
+      style={{ width: `${panelWidth}px` }}
+    >
+      <div
+        className={`panel-resize-handle ${isResizing ? 'resizing' : ''}`}
+        onMouseDown={handleMouseDown}
+      />
+      <button className="button ghost close-btn" onClick={onClose}>×</button>
+      <div className="detail-scroll-content">
+        <div className="detail-panel">
+          {allPapiezFields.length > 0 ? (
+            <>
+              <div className="detail-section-title">Szczegóły reklamy (Papierz)</div>
+              <table className="detail-table papierz-table">
+                <tbody>
+                  {allPapiezFields.map(([key, value]) => {
+                    const isGdprField = key === 'urlgdpr';
+                    const isMissingGdpr = isGdprField && (value === null || value === undefined || value === '');
+                    return (
+                      <tr key={key} className={isMissingGdpr ? 'gdpr-missing-row' : ''}>
+                        <th>{key}</th>
+                        <td className={isMissingGdpr ? 'gdpr-missing' : ''}>
+                          {value ?? 'N/A'}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </>
+          ) : (
+            <div className="detail-pending">
+              {code.papiez?.error ? (
+                <div className="detail-error">{code.papiez.error}</div>
+              ) : (
+                <div className="detail-info">Waiting for Papierz validation…</div>
+              )}
+            </div>
+          )}
 
-        {/* Papierz Details Section - Ordered Fields */}
-        {allPapiezFields.length > 0 ? (
-          <>
-            <div className="detail-section-title">Szczegóły reklamy (Papierz)</div>
-            <table className="detail-table papierz-table">
-              <tbody>
-                {allPapiezFields.map(([key, value]) => {
-                  const isGdprField = key === 'urlgdpr';
-                  const isMissingGdpr = isGdprField && (value === null || value === undefined || value === '');
-                  return (
-                    <tr key={key} className={isMissingGdpr ? 'gdpr-missing-row' : ''}>
+          {filteredUrlParams.length > 0 ? (
+            <>
+              <div className="detail-section-title">Inne parametry</div>
+              <table className="detail-table url-params-table">
+                <tbody>
+                  {filteredUrlParams.map(([key, value]) => (
+                    <tr key={key}>
                       <th>{key}</th>
-                      <td className={isMissingGdpr ? 'gdpr-missing' : ''}>
-                        {value ?? 'N/A'}
-                      </td>
+                      <td title={value}>{value}</td>
                     </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </>
-        ) : (
-          <div className="detail-pending">
-            {code.papiez?.error ? (
-              <div className="detail-error">{code.papiez.error}</div>
-            ) : (
-              <div className="detail-info">Waiting for Papierz validation…</div>
-            )}
-          </div>
-        )}
+                  ))}
+                </tbody>
+              </table>
+            </>
+          ) : null}
 
-        {/* Filtered URL Parameters (excluding duplicates shown elsewhere) */}
-        {filteredUrlParams.length > 0 ? (
-          <>
-            <div className="detail-section-title">Inne parametry</div>
-            <table className="detail-table url-params-table">
-              <tbody>
-                {filteredUrlParams.map(([key, value]) => (
-                  <tr key={key}>
-                    <th>{key}</th>
-                    <td title={value}>{value}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </>
-        ) : null}
+          {utmParams.length > 0 ? (
+            <>
+              <div className="detail-section-title">Parametry UTM (z przekierowania)</div>
+              <table className="detail-table url-params-table">
+                <tbody>
+                  {utmParams.map(([key, value]) => (
+                    <tr key={key}>
+                      <th>{key}</th>
+                      <td title={value}>{value}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              {code.redirectUrl ? (
+                <div className="redirect-url-info">
+                  Przekierowanie do: {code.redirectUrl}
+                </div>
+              ) : null}
+            </>
+          ) : null}
 
-        {/* UTM Parameters from redirect destination */}
-        {utmParams.length > 0 ? (
-          <>
-            <div className="detail-section-title">Parametry UTM (z przekierowania)</div>
-            <table className="detail-table url-params-table">
-              <tbody>
-                {utmParams.map(([key, value]) => (
-                  <tr key={key}>
-                    <th>{key}</th>
-                    <td title={value}>{value}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-            {code.redirectUrl ? (
-              <div className="redirect-url-info">
-                Przekierowanie do: {code.redirectUrl}
-              </div>
-            ) : null}
-          </>
-        ) : null}
-
-        {/* Full URL Section */}
-        <div className="detail-section-title">Pełny URL</div>
-        <div className="detail-url-full" title={code.url}>{code.url}</div>
+          <div className="detail-section-title">Pełny URL</div>
+          <div className="detail-url-full" title={code.url}>{code.url}</div>
+        </div>
       </div>
     </div>
   );
@@ -643,9 +726,10 @@ export default function App() {
   const [selectedCodeUrl, setSelectedCodeUrl] = useState(null);
   const [showOnlyCmCodes, setShowOnlyCmCodes] = useState(false);
   const [simpleViewMode, setSimpleViewMode] = useState(false);
+  const [columnWidths, setColumnWidths] = useState(DEFAULT_COLUMN_WIDTHS);
+  const [detailPanelWidth, setDetailPanelWidth] = useState(DEFAULT_PANEL_WIDTH);
   const portRef = useRef(null);
 
-  // Load saved filter on mount
   useEffect(() => {
     chrome.storage.local.get(FILTER_STORAGE_KEY, (result) => {
       if (result[FILTER_STORAGE_KEY]) {
@@ -654,14 +738,12 @@ export default function App() {
     });
   }, []);
 
-  // Save filter to storage when it changes
   useEffect(() => {
     if (filter !== undefined) {
       chrome.storage.local.set({ [FILTER_STORAGE_KEY]: filter });
     }
   }, [filter]);
 
-  // Load saved CM codes filter on mount
   useEffect(() => {
     chrome.storage.local.get(CM_CODES_FILTER_KEY, (result) => {
       if (result[CM_CODES_FILTER_KEY] !== undefined) {
@@ -670,12 +752,10 @@ export default function App() {
     });
   }, []);
 
-  // Save CM codes filter to storage when it changes
   useEffect(() => {
     chrome.storage.local.set({ [CM_CODES_FILTER_KEY]: showOnlyCmCodes });
   }, [showOnlyCmCodes]);
 
-  // Load saved Simple View mode on mount
   useEffect(() => {
     chrome.storage.local.get(SIMPLE_VIEW_STORAGE_KEY, (result) => {
       if (result[SIMPLE_VIEW_STORAGE_KEY] !== undefined) {
@@ -684,10 +764,37 @@ export default function App() {
     });
   }, []);
 
-  // Save Simple View mode to storage when it changes
   useEffect(() => {
     chrome.storage.local.set({ [SIMPLE_VIEW_STORAGE_KEY]: simpleViewMode });
   }, [simpleViewMode]);
+
+  useEffect(() => {
+    chrome.storage.local.get(COLUMN_STORAGE_KEY, (result) => {
+      if (result[COLUMN_STORAGE_KEY]) {
+        setColumnWidths({ ...DEFAULT_COLUMN_WIDTHS, ...result[COLUMN_STORAGE_KEY] });
+      }
+    });
+  }, []);
+
+  useEffect(() => {
+    if (columnWidths !== DEFAULT_COLUMN_WIDTHS) {
+      chrome.storage.local.set({ [COLUMN_STORAGE_KEY]: columnWidths });
+    }
+  }, [columnWidths]);
+
+  useEffect(() => {
+    chrome.storage.local.get(PANEL_WIDTH_STORAGE_KEY, (result) => {
+      if (result[PANEL_WIDTH_STORAGE_KEY]) {
+        setDetailPanelWidth(result[PANEL_WIDTH_STORAGE_KEY]);
+      }
+    });
+  }, []);
+
+  useEffect(() => {
+    if (detailPanelWidth !== DEFAULT_PANEL_WIDTH) {
+      chrome.storage.local.set({ [PANEL_WIDTH_STORAGE_KEY]: detailPanelWidth });
+    }
+  }, [detailPanelWidth]);
 
   useEffect(() => {
     const tabId = chrome?.devtools?.inspectedWindow?.tabId;
@@ -771,7 +878,7 @@ export default function App() {
     }
   }, [session, selectedCodeUrl]);
 
-  // Create a map of CM codes for quick lookup (MUST BE BEFORE filteredRequests)
+  // Must be declared before `filteredRequests` — the Simple View branch reads it.
   const cmCodesMap = useMemo(() => {
     if (!session || !session.cmCodes) return new Map();
     const map = new Map();
@@ -785,32 +892,27 @@ export default function App() {
     if (!session) return [];
     let filtered = session.requests.filter(createRequestFilter(filter));
 
-    // Filter to show only CM codes (trackimp/trackclk) if enabled
     if (showOnlyCmCodes) {
       filtered = filtered.filter(req => req.type === 'trackimp' || req.type === 'trackclk');
     }
 
-    // Simple View Mode: filter out "No data returned" and deduplicate
+    // Simple View hides CM rows that came back from Papierz with "No data returned",
+    // then collapses each (type, bSegment, dc_trk_aid, dc_trk_cid, ord) group to a
+    // single representative row so the user sees one entry per logical impression/click.
     if (simpleViewMode) {
-      // 1. Filter out requests without Papierz data
       filtered = filtered.filter(req => {
-        if (!req.isCmCode) return true; // Keep non-CM codes
-
+        // Non-CM requests have no Papierz data by design — always keep them.
+        if (!req.isCmCode) return true;
         const cmCode = cmCodesMap.get(req.url);
-        if (!cmCode) return true; // Keep if no CM code data
-
-        // Filter out if error is "No data returned from Papierz."
-        const hasNoData = cmCode.papiez?.error === 'No data returned from Papierz.';
-        return !hasNoData;
+        if (!cmCode) return true;
+        return cmCode.papiez?.error !== 'No data returned from Papierz.';
       });
 
-      // 2. Group by 4 parameters and select best from each group
       const groups = groupRequestsBySimpleViewParams(filtered);
       const deduplicated = [];
-
       groups.forEach((group) => {
         const bestRequest = selectBestRequestFromGroup(group.requests);
-        // Attach simple view params to request for rendering
+        // Stash the grouping params on the chosen row so the URL cell can render them.
         bestRequest._simpleViewParams = group.params;
         deduplicated.push(bestRequest);
       });
@@ -826,13 +928,13 @@ export default function App() {
     return session.cmCodes.find((code) => code.url === selectedCodeUrl) || null;
   }, [session, selectedCodeUrl]);
 
-  // Group impression and click codes by common identifier
   const impressionClickGroups = useMemo(() => {
     if (!session?.cmCodes) return new Map();
     return matchImpressionWithClick(session.cmCodes);
   }, [session?.cmCodes]);
 
-  // Map request URL to group identifier for visual grouping
+  // URL → group identifier, used by the table to draw a separator above the first
+  // row of each impression/click pair.
   const requestToGroupMap = useMemo(() => {
     const map = new Map();
     impressionClickGroups.forEach((group, identifier) => {
@@ -947,10 +1049,7 @@ export default function App() {
   return (
     <div className="app-shell">
       <div className="app-header">
-        <div className="title-group">
-          <h1>Campaign Manager Monitor</h1>
-          <span>Tracking requests on tab {rootTabId ?? '—'}</span>
-        </div>
+        <span className="tracking-info">Tracking requests on tab {rootTabId ?? '—'}</span>
         <span className={resolveStatusClass(status)}>{resolveStatusLabel(status)}</span>
       </div>
 
@@ -1029,7 +1128,6 @@ export default function App() {
 
       {papiezState.lastError ? <div className="warning-banner">{papiezState.lastError}</div> : null}
 
-      {/* Single panel layout - Network tab style */}
       <section className="panel main-panel">
         <header className="panel-header">
           <h2>Request Monitor</h2>
@@ -1043,19 +1141,22 @@ export default function App() {
           fallbackColor={fallbackTabColor}
           cmCodesMap={cmCodesMap}
           requestToGroupMap={requestToGroupMap}
-          impressionClickGroups={impressionClickGroups}
           simpleViewMode={simpleViewMode}
+          columnWidths={columnWidths}
+          onColumnResize={(key, width) => {
+            setColumnWidths(prev => ({ ...prev, [key]: width }));
+          }}
         />
       </section>
 
-      {/* Auth card moved to bottom */}
       <AuthCard authInfo={authInfo} loading={authLoading} error={authError} onLogin={handleLogin} onLogout={handleLogout} />
 
-      {/* Detail panel overlay */}
       {selectedCode ? (
         <CodeDetailPanel
           code={selectedCode}
           onClose={() => setSelectedCodeUrl(null)}
+          panelWidth={detailPanelWidth}
+          onPanelResize={setDetailPanelWidth}
         />
       ) : null}
     </div>
