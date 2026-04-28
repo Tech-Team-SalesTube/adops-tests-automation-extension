@@ -45,8 +45,6 @@ function copyDir(src, dest) {
     'devtools.html',
     'devtools.js',
     'click-listener.js',
-    'results.html',
-    'results.js',
   ];
 
   filesToCopy.forEach((relativePath) => {
